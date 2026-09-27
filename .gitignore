@@ -1,0 +1,12 @@
+work/
+output/
+analysis/
+input/
+test/
+.nextflow*
+__pycache__/
+*.pyc
+pipeline_*.html
+pipeline_trace.txt
+*.err
+*.out
