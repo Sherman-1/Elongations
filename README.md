@@ -1,727 +1,381 @@
-# DMEL - Pipeline de Détection d'Extensions de Protéines chez *Drosophila melanogaster*
+# DMEL — Détection et validation d'extensions terminales protéiques chez *Drosophila melanogaster*
 
-## 📋 Table des Matières
+Pipeline Nextflow pour l'identification, chez *D. melanogaster* (Dmel), de segments N-terminaux et C-terminaux absents des homologues annotés des autres espèces, et pour la recherche de ces segments dans l'ADN génomique non annoté des drosophiles voisines.
 
-1. [Vue d'ensemble](#vue-densemble)
-2. [Objectif Scientifique](#objectif-scientifique)
-3. [Architecture du Pipeline](#architecture-du-pipeline)
-4. [Structure du Projet](#structure-du-projet)
-5. [Données d'Entrée](#données-dentrée)
-6. [Workflow Détaillé](#workflow-détaillé)
-7. [Modules Nextflow](#modules-nextflow)
-8. [Scripts Shell (bin/)](#scripts-shell-bin)
-9. [Outils Utilisés](#outils-utilisés)
-10. [Configuration et Exécution](#configuration-et-exécution)
-11. [Outputs](#outputs)
-12. [Reconstruction du Pipeline](#reconstruction-du-pipeline)
+*Pipeline développé par Simon Herman — équipe BIM.*
 
----
+## Sommaire
 
-## Vue d'ensemble
-
-Ce pipeline Nextflow est conçu pour **valider et caractériser les extensions** N-terminales (nter) et C-terminales (cter) des protéines de *Drosophila melanogaster* (Dmel). Pour cela, il utilise Dmel comme référence de haute qualité et recherche si ses extensions "uniques" sont conservées dans l'ADN génomique (non annoté) des espèces voisines.
-
-**Technologies principales :**
-- **Nextflow** : Orchestration du workflow 
-- **Singularity** : Conteneurisation
-- **PBS Pro** : Gestionnaire de ressources HPC
-- **Python/Polars** : Traitement de données haute performance
-- **FASTA36 (ssearch36/tfastx)** : Alignements Smith-Waterman précis
+1. [Contexte et objectif](#1-contexte-et-objectif)
+2. [Matériel](#2-matériel)
+3. [Méthodes](#3-méthodes)
+4. [Sorties](#4-sorties)
+5. [Utilisation](#5-utilisation)
+6. [Organisation du dépôt](#6-organisation-du-dépôt)
+7. [Références](#7-références)
 
 ---
 
-## Objectif Scientifique
+## 1. Contexte et objectif
 
-### Problématique
-L'annotation automatique des génomes conduit souvent à des codons START ou STOP erronés, ignorant parfois des segments codants conservés. *D. melanogaster*, étant l'espèce la mieux annotée, possède des protéines qui semblent plus longues que leurs homologues chez d'autres espèces. Ce pipeline cherche à déterminer si cette "longueur supplémentaire" est :
-- Une **innovation réelle** de Dmel.
-- Une **erreur d'annotation de Dmel** (START trop en amont).
-- Ou, plus fréquemment, une **sous-annotation des autres espèces** (le segment existe dans leur ADN mais n'a pas été prédit comme codant).
+L'annotation automatique des génomes produit fréquemment des codons d'initiation ou de terminaison erronés, ce qui conduit à ignorer des segments codants pourtant conservés. *D. melanogaster* étant l'espèce du genre la mieux annotée, un certain nombre de ses protéines apparaissent plus longues que leurs homologues annotés chez les autres espèces. Pour chacune de ces différences de longueur, trois hypothèses sont envisageables :
 
-### Approche
-1. **Recherche contre NR (Non-Redundant database)** : Identifier les protéines de Dmel qui possèdent un segment (N-ter ou C-ter) non retrouvé chez 95% des autres espèces.
-2. **Recherche locale ciblée** : Comparer ces segments de Dmel contre les génomes des drosophiles voisines.
-3. **Analyse nucléotidique (Slop)** : Étendre virtuellement les gènes des voisins (sujets) et aligner la séquence de Dmel (query) pour voir si le segment y est présent.
+1. une **innovation réelle** de la lignée Dmel ;
+2. une **erreur d'annotation de Dmel** (codon START placé trop en amont, ou STOP trop en aval) ;
+3. une **sous-annotation de l'espèce voisine**, le segment étant présent dans son génome mais non prédit comme codant.
 
-### Critères de sélection des candidats (via Diamond vs NR)
-- **N-ter** : Protéines de Dmel où **moins de 5%** des homologues dans NR possèdent un alignement couvrant le début de la protéine (qstart < 20). En d'autres termes, Dmel a un début "unique".
-- **C-ter** : Protéines de Dmel où **moins de 5%** des homologues dans NR possèdent un alignement couvrant la fin de la protéine (qlend < 20).
+Le pipeline vise à discriminer ces hypothèses en trois temps : (i) identification, par recherche contre la base NR, des protéines de Dmel dont une extrémité n'est retrouvée chez pratiquement aucun homologue ; (ii) alignement de ces candidats contre les protéomes des drosophiles voisines ; (iii) pour chaque paire candidat/homologue, extension virtuelle du gène voisin dans l'ADN génomique et alignement nucléotidique afin de tester la présence du segment manquant.
 
 ---
 
-## Architecture du Pipeline
+## 2. Matériel
+
+### 2.1 Espèce focale
+
+| Fichier | Contenu | Taille |
+| --- | --- | --- |
+| `input/focal/Dmel.fna` | Séquences génomiques de *D. melanogaster* (assemblage : *à préciser*) | ~145 Mo |
+| `input/focal/Dmel.gff` | Annotation GFF3 associée (version : *à préciser*) | ~164 Mo |
+| `input/focal/Dmel.proteome` | Protéome dérivé de l'annotation | ~20 Mo |
+
+### 2.2 Espèces voisines
+
+Soixante-trois espèces du genre *Drosophila* (`input/neighbors/`), chacune représentée par un génome (`[Species].fna`) et son annotation GFF3 (`[Species].gff`). L'index `input/neighbors.genome` recense les génomes disponibles. Les relations phylogénétiques entre espèces sont décrites dans `Drosophila_tree.nwk` (format Newick) et incluent notamment les espèces du groupe *melanogaster* (Dsim, Dsec, Dmau, Dere, Dsan, Dyak, Dtei, Deug).
+
+### 2.3 Bases de données externes
+
+- **NCBI NR** au format DIAMOND (`nr_2.0.13.dmnd`), interrogée avec une restriction aux eucaryotes (taxid 2759).
+- **NCBI Taxonomy** (`taxdump`), utilisée pour la conversion souche → espèce et pour la définition de l'ensemble des taxids eucaryotes.
+
+### 2.4 Outils logiciels
+
+Tous les chemins d'exécutables sont paramétrables dans `nextflow.config` (voir §5.2). Les versions exactes utilisées sont à renseigner dans la colonne correspondante.
+
+| Outil | Version | Usage dans le pipeline | Référence |
+| --- | --- | --- | --- |
+| Nextflow (DSL2) | — | Orchestration du workflow | Di Tommaso et al., 2017 |
+| Singularity | — | Conteneurisation (AGAT) | Kurtzer et al., 2017 |
+| PBS Pro | — | Ordonnancement HPC | — |
+| DIAMOND | — | Recherche de similarité contre NR | Buchfink et al., 2021 |
+| BLAST+ (`makeblastdb`, `blastp`) | — | Base de données protéique locale, alignements protéiques | Camacho et al., 2009 |
+| FASTA36 (`ssearch36`, `tfasty36`) | — | Alignements Smith-Waterman prot/prot, nuc/nuc et prot/ADN traduit | Pearson & Lipman, 1988 ; Pearson, 1991 |
+| gffread | — | Extraction des CDS et des protéines depuis GFF + génome | Pertea & Pertea, 2020 |
+| BEDTools (`slop`) | — | Extension de coordonnées génomiques | Quinlan & Hall, 2010 |
+| SAMtools (`faidx`) | — | Indexation des génomes | Danecek et al., 2021 |
+| SeqKit | — | Manipulation de fichiers FASTA | Shen et al., 2016 |
+| TaxonKit | — | Manipulation de la taxonomie NCBI | Shen & Ren, 2021 |
+| AGAT | — | Standardisation des GFF | Dainat |
+| UCSC utilities (`faTrans`, `faSize`) | — | Traduction ADN → protéine, tailles de séquences | Kent et al., 2002 |
+| DuckDB | — | Conversion Parquet → TSV | Raasveldt & Mühleisen, 2019 |
+| Python (Polars, Biopython, gff3_parser) | — | Parsing et traitement des tables | Cock et al., 2009 |
+
+---
+
+## 3. Méthodes
+
+### 3.1 Vue d'ensemble
+
+Le pipeline s'articule en quatre étapes (Figure 1) : prétraitement des données (§3.2), identification des candidats par recherche contre NR (§3.3), recherche d'homologues chez les espèces voisines (§3.4) et analyse nucléotidique des extensions (§3.5). Les extrémités N-terminale (« nter ») et C-terminale (« cter ») sont traitées par deux branches symétriques.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                          main.nf                                 │
-│                     └── align workflow                          │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-        ┌───────────────────────┼───────────────────────┐
-        ▼                       ▼                       ▼
-┌───────────────┐    ┌──────────────────┐    ┌──────────────────┐
-│ A1_preprocess │    │  create_taxon_   │    │     A2_NR        │
-│               │    │     maps         │    │                  │
-│ - extract     │    │ - strain2species │    │ - diamond vs NR  │
-│   proteomes   │    │ - eukaryotes     │    │ - parse results  │
-│ - concat      │    │   taxids         │    │ - identify       │
-│ - makedb      │    │                  │    │   candidates     │
-│ - faidx       │    └──────────────────┘    └────────┬─────────┘
-│ - geneCoords  │                                      │
-└───────┬───────┘                                      │
-        │                                              │
-        │          ┌───────────────────────────────────┘
-        │          │
-        ▼          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    A3_search_extensions                          │
-│                                                                  │
-│  ┌─────────────────────────┐    ┌─────────────────────────────┐  │
-│  │     N-terminal          │    │       C-terminal            │  │
-│  │                         │    │                             │  │
-│  │  grep_nter              │    │    grep_cter                │  │
-│  │  ssearch_nter           │    │    ssearch_cter             │  │
-│  │  parseNter              │    │    parseCter                │  │
-│  │         │               │    │           │                 │  │
-│  │    ┌────┴────┐          │    │      ┌────┴────┐            │  │
-│  │    ▼         ▼          │    │      ▼         ▼            │  │
-│  │ big_sstart small_sstart │    │  big_send   small_send      │  │
-│  │    │         │          │    │      │         │            │  │
-│  │    ▼         ▼          │    │      ▼         ▼            │  │
-│  │ ssearch   elongate_     │    │  ssearch   elongate_        │  │
-│  │ + parse   + align       │    │  + parse   + align          │  │
-│  │           + parse       │    │            + parse          │  │
-│  └─────────────────────────┘    └─────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-                         ┌──────────────┐
-                         │   OUTPUTS    │
-                         │              │
-                         │ output/nter/ │
-                         │ output/cter/ │
-                         └──────────────┘
+                              main.nf → align
+                                    │
+             ┌──────────────────────┼──────────────────────┐
+             ▼                      ▼                      ▼
+     A1_preprocess          create_taxon_maps            A2_NR
+  extraction protéomes      strain2species        DIAMOND vs NR (euk.)
+  concat / faidx / makedb   eukaryotes taxids     parseDiamond → candidats
+  getGeneCoords                                   nter / cter
+             │                                              │
+             └──────────────────────┬───────────────────────┘
+                                    ▼
+                         A3_search_extensions
+                  ssearch36 candidats vs protéome local
+                  parseNter / parseCter → big | small
+                                    │
+                     ┌──────────────┴──────────────┐
+                     ▼                             ▼
+             big_sstart / big_send       small_sstart / small_send
+             ssearch nuc (CDS seul)      élongation (bedtools slop)
+             + parse                     + alignements multiples
+                                         + parse (gaps, codons, élongation récupérée)
+                                    │
+                                    ▼
+                          output/nter/  output/cter/
 ```
 
----
+*Figure 1. Architecture du pipeline.*
 
-## Structure du Projet
+### 3.2 Prétraitement des données (`A1_preprocess.nf`, `create_taxon_maps.nf`)
 
-```
-DMEL/
-├── main.nf                    # Point d'entrée du workflow
-├── nextflow.config            # Configuration Nextflow (params, executor, singularity)
-├── run.sh / nxtflw_run.sh     # Scripts de soumission PBS
-│
-├── flows/                     # Workflows principaux
-│   ├── align.nf               # Workflow principal d'alignement
-│   └── test.nf                # Workflow de test
-│
-├── subworkflows/              # Sous-workflows
-│   ├── A1_preprocess.nf       # Prétraitement des données
-│   ├── A2_NR.nf               # Recherche contre NR
-│   ├── A3_search_extensions.nf # Recherche d'extensions
-│   └── specifics/             # Traitement spécifique nter/cter
-│       ├── nter_big_sstart.nf
-│       ├── nter_small_sstart.nf
-│       ├── cter_big_send.nf
-│       └── cter_small_send.nf
-│
-├── modules/                   # Modules Nextflow (processus)
-│   ├── preprocess/            # Modules de prétraitement
-│   │   ├── extract_protein.nf
-│   │   ├── makedb.nf
-│   │   ├── faidx.nf
-│   │   ├── concat.nf
-│   │   ├── sample_proteins.nf
-│   │   ├── getGeneCoords.nf
-│   │   └── check_annotation.nf
-│   ├── NR/                    # Modules pour recherche NR
-│   │   ├── diamond.nf
-│   │   ├── parseDiamond.nf
-│   │   ├── split_ids.nf
-│   │   └── split_df.nf
-│   ├── nter/                  # Modules N-terminaux
-│   │   ├── treatBigSstart.nf
-│   │   ├── treatSmallSstart.nf
-│   │   └── final.nf
-│   ├── cter/                  # Modules C-terminaux
-│   │   ├── treatBigSend.nf
-│   │   └── treatSmallSend.nf
-│   ├── blastp.nf              # Alignements protéiques
-│   ├── grepSeq.nf             # Extraction de séquences
-│   ├── create_taxon_maps.nf   # Création maps taxonomiques
-│   ├── parseNeighborsBlastp.nf # Parsing des résultats blastp
-│   ├── standardGff.nf         # Standardisation GFF
-│   └── ssearch.nf             # Alignements ssearch
-│
-├── bin/                       # Scripts exécutables
-│   ├── ssearch.sh             # Wrapper ssearch36
-│   ├── gff.sh                 # Utilitaires GFF
-│   ├── split_dataframe.sh     # Split dataframes
-│   ├── test.sh                # Tests
-│   ├── nter/                  # Scripts N-terminaux
-│   │   ├── big_nuc_search.sh
-│   │   └── small_nuc_search.sh
-│   └── cter/                  # Scripts C-terminaux
-│       ├── big_nuc_search.sh
-│       └── small_nuc_search.sh
-│
-├── src/                       # Code source C++
-│   ├── rmStartStop.cpp        # Suppression start/stop codons
-│   ├── parseCoati.cpp         # Parsing alignements Coati
-│   ├── json.hpp               # Bibliothèque JSON
-│   └── compil.sh              # Script de compilation
-│
-├── container/                 # Conteneurs Singularity
-│   └── agat.sif               # Container AGAT
-│
-├── input/                     # Données d'entrée
-│   ├── focal/                 # Espèce focale (D. melanogaster)
-│   │   ├── Dmel.fna           # Séquences génomiques
-│   │   ├── Dmel.gff           # Annotations
-│   │   └── Dmel.proteome      # Protéome
-│   ├── neighbors/             # Espèces voisines (~63 espèces)
-│   │   └── [Species].{fna,gff}
-│   └── neighbors.genome       # Index des génomes voisins
-│
-├── output/                    # Résultats
-│   ├── nter/                  # Candidats N-terminaux
-│   └── cter/                  # Candidats C-terminaux
-│
-├── test/                      # Fichiers de test et résultats intermédiaires
-├── Drosophila_tree.nwk        # Arbre phylogénétique Newick
-└── Dmel.tsv                   # Données tabulaires (~1.1GB)
+**Extraction des protéomes.** Pour chaque espèce, le protéome est dérivé de l'annotation et du génome avec `gffread` (option `-J`, qui écarte les transcrits sans codon START ou avec un STOP en phase), puis les gaps sont retirés avec `seqkit` :
+
+```bash
+gffread -J -y - -g ${fna} ${gff} | seqkit seq --remove-gaps - > ${species}.faa
 ```
 
----
+**Constitution des jeux de données concaténés.** Les GFF, génomes et protéomes de l'ensemble des espèces voisines sont concaténés (`full_gff`, `full_fna`, `local_proteome`). Le génome concaténé est indexé avec `samtools faidx`, et une base de données protéique locale est construite avec `makeblastdb` (`-dbtype prot -parse_seqids -hash_index`).
 
-## Données d'Entrée
+**Coordonnées géniques.** Pour chaque gène, le module `getGeneCoords` calcule, en tenant compte du brin, la distance entre le début du CDS et le début du gène (région *upstream*) et entre la fin du CDS et la fin du gène (région *downstream*). Ces distances bornent l'élongation appliquée en §3.5.1.
 
-### Espèce Focale (input/focal/)
-- **Dmel.fna** : Séquences génomiques de *D. melanogaster* (~145 MB)
-- **Dmel.gff** : Annotations GFF3 (~164 MB)
-- **Dmel.proteome** : Protéome extrait (~20 MB)
+**Tables taxonomiques.** À partir du `taxdump` NCBI, `taxonkit` produit une table de correspondance souche → espèce (`strain2species.csv`) et la liste des taxids eucaryotes descendant du taxid 2759 (`eukaryotes.csv`).
 
-### Espèces Voisines (input/neighbors/)
-~63 espèces du genre *Drosophila* avec pour chacune :
-- `[Species].fna` : Séquences génomiques
-- `[Species].gff` : Annotations GFF3
+### 3.3 Identification des candidats par recherche contre NR (`A2_NR.nf`)
 
-### Arbre Phylogénétique
-```newick
-(((((Drosophila_rhopaloa:16.32455000,Drosophila_elegans:16.32455000)...
+**Recherche de similarité.** Le protéome de Dmel est aligné contre NR avec `diamond blastp` en mode `--fast`, restreint aux eucaryotes, sans limite sur le nombre de cibles :
+
+```bash
+diamond blastp --query ${query} --db ${db} --taxonlist 2759 \
+  --outfmt 6 qseqid sseqid qlen qstart qend qcovhsp scovhsp ppos staxids \
+  --max-target-seqs 0 --fast -e 0.00001
 ```
-Contient les relations phylogénétiques entre les espèces utilisées, incluant :
-- Dsim, Dsec, Dmau, Dmel, Dere, Dsan, Dyak, Dtei, Deug...
 
-### Base de Données Externe
-- **NR (Non-Redundant)** : `/datas/NR/nr_2.0.13.dmnd` (format Diamond)
-- **Taxdump** : Données taxonomiques NCBI
+Les alignements sont ensuite filtrés sur la couverture de la query (`qcovhsp` > 60 %), la couverture du sujet (`scovhsp` > 60 %) et le pourcentage de positions positives (`ppos` > 70 %).
 
----
+**Parallélisation.** Les identifiants de queries sont répartis en `n` groupes (30 par défaut ; `split_ids`), et la table DIAMOND est découpée en conséquence (`split_df`) avant parsing.
 
-## Workflow Détaillé
+**Sélection des candidats (`parseDiamond`).** Pour chaque protéine de Dmel, les sujets sont rattachés à leur espèce via `strain2species` et le nombre d'espèces distinctes est comptabilisé. Deux proportions sont alors calculées :
 
-### Étape 1 : Prétraitement (`A1_preprocess.nf`)
+- la proportion d'espèces possédant un alignement couvrant le début de la query (`qstart` < 20 résidus) ;
+- la proportion d'espèces possédant un alignement couvrant la fin de la query (`qlen − qend` < 20 résidus).
 
-**But** : Préparer les données pour l'analyse
+Une protéine est retenue comme **candidat N-terminal** lorsque la première proportion est ≤ 5 %, et comme **candidat C-terminal** lorsque la seconde est ≤ 5 %. Autrement dit, l'extrémité considérée de la protéine de Dmel n'est retrouvée chez pratiquement aucun homologue de NR.
 
-**Processus** :
+> Note : le nom des colonnes de sortie (`percent_nter_q_15`, `percent_cter_q_15`) suggère un seuil de 15 résidus. La valeur effectivement codée dans `parseDiamond.nf` est à vérifier.
 
-1. **extract_protein** : Extraction des protéomes depuis GFF+FNA
-   ```bash
-   gffread -J -y - -g ${fna} ${gff} | seqkit seq --remove-gaps - > ${species}.faa
-   ```
+Le module produit la liste des identifiants candidats (`nter_candidates`, `cter_candidates`) ainsi qu'une table de statistiques par query.
 
-2. **concat** : Concaténation de tous les fichiers GFF, FNA, et protéomes
+### 3.4 Recherche d'homologues chez les espèces voisines (`A3_search_extensions.nf`)
 
-3. **faidx** : Indexation des génomes avec samtools
-   ```bash
-   samtools faidx ${genome}
-   ```
+**Alignements protéiques.** Les séquences des candidats sont extraites du protéome focal (`seqkit grep`) puis alignées contre le protéome local concaténé avec `ssearch36` (Smith-Waterman), via le wrapper `bin/ssearch.sh` :
 
-4. **blast_makedb** : Création de la base BLAST locale
-   ```bash
-   makeblastdb -in $fasta -dbtype 'prot' -out blast -parse_seqids -hash_index
-   ```
-
-5. **getGeneCoords** : Calcul des coordonnées upstream/downstream pour chaque gène
-   - Calcule la distance entre le début du CDS et le début du gène (upstream)
-   - Calcule la distance entre la fin du CDS et la fin du gène (downstream)
-   - Gère le strand (+/-)
-
-**Outputs** :
-- `full_gff` : Annotations concaténées
-- `full_fna` : Génomes concaténés
-- `index` : Index FASTA
-- `focal_proteins` : Protéome focal
-- `local_db` : Base de données BLAST locale
-- `geneCoords` : Coordonnées des gènes
-
----
-
-### Étape 2 : Création des Maps Taxonomiques (`create_taxon_maps`)
-
-**But** : Créer des dictionnaires pour le filtrage taxonomique
-
-**Utilise** : `taxonkit` (outil de manipulation taxonomique NCBI)
-
-**Outputs** :
-- `strain2species.csv` : Mapping souche → espèce
-- `eukaryotes.csv` : Liste des taxids eucaryotes (taxid 2759)
-
----
-
-### Étape 3 : Recherche contre NR (`A2_NR.nf`)
-
-**But** : Identifier les candidats potentiels avec des extensions manquantes
-
-**Processus** :
-
-1. **big_diamond** : Recherche Diamond contre NR (database eucaryotes taxid 2759)
-   ```bash
-   diamond blastp --query ${query} --db ${db} --taxonlist 2759 \
-     --outfmt 6 qseqid sseqid qlen qstart qend qcovhsp scovhsp ppos staxids \
-     --max-target-seqs 0 --fast -e 0.00001
-   ```
-   - Filtres : qcov > 60%, scov > 60%, ppos > 70%
-
-2. **split_ids** : Division des IDs en N groupes (parallélisation)
-
-3. **split_df** : Division du dataframe par groupe d'IDs
-
-4. **parseDiamond** : Analyse des résultats pour identifier les candidats
-   - Compte les espèces uniques
-   - Calcule le % d'espèces avec alignement N-ter complet (qstart < 20)
-   - Calcule le % d'espèces avec alignement C-ter complet (qlend < 20)
-   
-   **Critères de sélection** :
-   - **N-ter candidats** : `percent_nter_q_15 <= 5%`
-   - **C-ter candidats** : `percent_cter_q_15 <= 5%`
-
-**Outputs** :
-- `nter_candidates` : Liste des IDs candidats N-terminaux
-- `cter_candidates` : Liste des IDs candidats C-terminaux
-- `statistics` : Statistiques détaillées
-
----
-
-### Étape 4 : Recherche d'Extensions (`A3_search_extensions.nf`)
-
-**But** : Analyser en détail chaque candidat contre les espèces voisines locales
-
-#### 4.1 Traitement N-terminal
-
-**Flux** :
-1. `grep_nter` : Extraction des protéines candidates
-2. `ssearch_nter` : Alignement protéique contre le protéome local (ssearch36)
-3. `parseNter` : Parsing et catégorisation
-
-**Catégorisation** :
-- **small_sstart** : Homologues avec sstart < 5 (proches du début)
-  - Extension potentielle dans la région upstream du gène
-- **big_sstart** : Homologues avec sstart >= 5 (éloignés du début)
-  - L'alignement ne couvre pas le début de l'homologue
-
-#### 4.2 Traitement C-terminal
-
-**Flux similaire** :
-- **small_send** : Homologues avec slend < 5
-- **big_send** : Homologues avec slend >= 5
-
----
-
-### Étape 5 : Analyse Nucléotidique (modules nter/ et cter/)
-
-#### Pour les "small sstart/send" :
-
-**Processus `small_elongate_and_align`** (script `bin/nter/small_nuc_search.sh`) :
-
-1. **Élongation des sujets** :
-   - Calcul de l'élongation : `elongation = qstart * 3 * 1.5` (arrondi multiple de 3)
-   - Extension de la séquence génomique du sujet en amont (nter) ou aval (cter)
-   - Utilisation de `bedtools slop` pour étendre les coordonnées
-
-2. **Alignements multiples** :
-   - `ssearch36` nucléotide vs nucléotide (séquence élongée)
-   - `ssearch36` nucléotide vs nucléotide (séquence standard)
-   - `ssearch36` protéine vs protéine (séquence élongée traduite)
-
-3. **Parsing des alignements** (`parse_small_table`) :
-   - Lecture du format "mA" de ssearch pour récupérer les alignements position par position
-   - Comptage des gaps
-   - Vérification des codons start/stop in-frame
-   - Calcul de l'élongation récupérée
-
-**Outputs par sujet** :
-- `*_complete_small_ssearch_elong.tsv` : Résultats ssearch élongé
-- `*_complete_small_ssearch_elong.aln` : Alignements détaillés
-- `*_complete_small_ssearch_short.tsv` : Résultats ssearch standard
-- `*_complete_small_tfastx.tsv` : Résultats protéiques
-- `*_subjects_thresholds.tsv` : Seuils calculés par sujet
-
-#### Pour les "big sstart/send" :
-
-**Processus `ssearch_big_sstart/send`** (script `bin/nter/big_nuc_search.sh`) :
-
-1. Extraction des CDS du sujet (sans élongation)
-2. Alignement nucléotidique ssearch36
-3. Comparaison de la position d'alignement avec la position protéique
-
----
-
-## Modules Nextflow
-
-### Modules Prétraitement (modules/preprocess/)
-
-| Module | Fonction | Input | Output |
-|--------|----------|-------|--------|
-| `extract_protein` | Extraire protéome de GFF+FNA | (species, fna, gff) | *.faa |
-| `makedb` | Créer base BLAST/Diamond | fasta | db directory / *.dmnd |
-| `faidx` | Indexer génome | genome | *.fai |
-| `concat` | Concaténer fichiers | files[] | concatenated.* |
-| `sample_proteins` | Échantillonner protéines | (species, fna, gff), n | *.faa |
-| `getGeneCoords` | Calculer coordonnées | gff | gene_coords.tsv |
-| `checkAnnot` | Vérifier annotations uniques | - | - |
-
-### Modules NR (modules/NR/)
-
-| Module | Fonction | Input | Output |
-|--------|----------|-------|--------|
-| `big_diamond` | Recherche Diamond massive | query, db, taxid | *.tsv |
-| `parseDiamond` | Parser résultats Diamond | df, strain2species, eukaryotes | nter_candidates, cter_candidates, stats |
-| `split_ids` | Diviser IDs en N groupes | dataframe, n | *.txt files |
-| `split_df` | Filtrer dataframe par IDs | df, ids | *.tsv |
-
-### Modules d'Alignement (modules/)
-
-| Module | Fonction | Input | Output |
-|--------|----------|-------|--------|
-| `blastp_strict` | BLASTp strict | query, db_dir | *.tsv |
-| `blastp_souple` | BLASTp souple (short) | query, db_dir | *.tsv |
-| `ssearch` | Alignement ssearch36 | query, subjects, cpus, mem | *.tsv |
-| `seqkitGrep` | Extraire séquences par IDs | ids, fasta | output.fa |
-
-### Modules N-terminal (modules/nter/)
-
-| Module | Fonction |
-|--------|----------|
-| `ssearch_big_sstart` | Alignement pour gros sstart |
-| `parse_big_table` | Parsing résultats gros sstart |
-| `small_elongate_and_align` | Élongation + alignements multiples |
-| `parse_small_table` | Parsing complexe avec analyse des gaps/codons |
-
-### Modules C-terminal (modules/cter/)
-
-| Module | Fonction |
-|--------|----------|
-| `ssearch_big_send` | Alignement pour gros send |
-| `parse_big_table` | Parsing résultats gros send |
-| `small_elongate_and_align` | Élongation + alignements multiples |
-| `parse_small_table` | Parsing avec analyse des gaps/codons |
-
-### Module Parsing Principal (`parseNeighborsBlastp.nf`)
-
-**Processus `nter`** et **`cter`** : 
-- Parsing Python avec Polars
-- Filtrage homologie : evalue <= 1e-5, qcovhsp >= 70%, ppos > 50%
-- Identification des "bad species" (espèces avec alignement complet)
-- Catégorisation en big/small basée sur sstart/send
-- Output en format Parquet par query
-
----
-
-## Scripts Shell (bin/)
-
-### bin/ssearch.sh
-Wrapper pour ssearch36 avec parsing Polars :
 ```bash
 ssearch36 -3 -p -s BL50 -f -11 -g -1 -T${ncpus} -XM${mem}G -m8BCL query subjects
 ```
-- Matrice BL50, pénalités gap -11/-1
-- Output format BLAST-like
 
-### bin/nter/small_nuc_search.sh
-Script principal pour l'analyse N-terminale des petits sstart :
+soit une matrice BLOSUM50, des pénalités de gap d'ouverture −11 et d'extension −1, et une sortie tabulaire de type BLAST. Des modules `blastp` (strict et « souple ») sont également disponibles en alternative.
 
-1. **Lecture des paramètres** depuis fichier Parquet (via duckdb)
-2. **Pour chaque sujet** :
-   - Calcul élongation = max(qstart*3, upstream) * 1.5
-   - Extraction CDS avec gffread
-   - Extension avec bedtools slop (selon strand)
-   - Extraction séquence élongée
-   - Alignements multiples (ssearch nuc, ssearch prot, tfastx)
-3. **Création des seuils** : threshold = elongation - 2
+**Filtrage des homologues (`parseNeighborsBlastp.nf`, Polars).** Sont conservés les alignements satisfaisant *e*-value ≤ 10⁻⁵, `qcovhsp` ≥ 70 % et `ppos` > 50 %. Les espèces dont un homologue présente déjà un alignement couvrant l'extrémité de la query (« bad species ») sont écartées, l'extension n'y étant pas manquante.
 
-### bin/nter/big_nuc_search.sh
-Script pour l'analyse N-terminale des gros sstart :
-1. Conversion Parquet → TSV
-2. Extraction CDS standards (sans élongation)
-3. Alignement ssearch nucléotidique
-4. Mapping qstart protéique → nucléotidique
+**Catégorisation des homologues.** Chaque paire query/sujet est classée selon la position de l'alignement sur le sujet :
 
-### bin/cter/small_nuc_search.sh et big_nuc_search.sh
-Équivalents pour l'analyse C-terminale (inversé : extension côté 3')
+| Branche | Variable | Catégorie « small » | Catégorie « big » |
+| --- | --- | --- | --- |
+| N-terminale | `sstart` | < 5 | ≥ 5 |
+| C-terminale | `slen − send` | < 5 | ≥ 5 |
+
+Dans la catégorie **small**, l'alignement atteint l'extrémité annotée du sujet : si le segment manquant existe, il doit se situer au-delà du CDS annoté, dans la région *upstream* (N-ter) ou *downstream* (C-ter) du gène. Dans la catégorie **big**, l'alignement s'interrompt avant l'extrémité du sujet : le segment peut être présent mais divergent au sein du CDS annoté, ou absent.
+
+Les résultats sont stockés au format Parquet, une table par query, et une table `mRNA_species.tsv` conserve la correspondance transcrit → espèce.
+
+### 3.5 Analyse nucléotidique des extensions (`modules/nter/`, `modules/cter/`)
+
+#### 3.5.1 Homologues de catégorie « small » (`small_elongate_and_align`, `bin/{nter,cter}/small_nuc_search.sh`)
+
+**Élongation des sujets.** Pour chaque sujet, la longueur d'élongation *L* (en nucléotides) est calculée à partir de la position de début (N-ter) ou de fin (C-ter) de l'alignement sur la query et de la longueur de la région intergénique disponible :
+
+```
+L = max(3 × qstart, upstream) × 1.5, arrondi au multiple de 3 inférieur
+```
+
+Les coordonnées du CDS du sujet sont extraites avec `gffread`, puis étendues de *L* nucléotides avec `bedtools slop` du côté 5′ (N-ter) ou 3′ (C-ter), en respectant le brin. La séquence étendue est extraite du génome concaténé indexé.
+
+**Alignements.** Trois alignements sont réalisés pour chaque paire :
+
+1. `ssearch36` nucléotide/nucléotide : CDS de la query contre le CDS du sujet **élongé** ;
+2. `ssearch36` nucléotide/nucléotide : CDS de la query contre le CDS du sujet **non élongé** (contrôle) ;
+3. `ssearch36` protéine/protéine : protéine de la query contre la traduction (`faTrans`) du sujet élongé ; un alignement `tfasty36` (protéine contre ADN traduit dans les six cadres) est également produit.
+
+Le seuil de détection propre à chaque sujet est fixé à *T* = *L* − 2 nucléotides.
+
+**Parsing (`parse_small_table`).** L'alignement élongé est produit au format `-m A` de FASTA36, qui fournit la correspondance position par position entre query et sujet. À partir de cette sortie sont calculés : le nombre de gaps sur la query et sur le sujet ; la présence de codons STOP et START en phase dans la région élongée ; la présence d'un ATG sur le sujet élongé en regard du début de la query (`atg_on_elongated_subject_facing_query_start`) et, réciproquement, d'une méthionine sur la query en regard du début du sujet annoté ; l'élongation effectivement récupérée, en nucléotides (`raw_recovered_elongation`) et rapportée à *L* (`recovered_elongation`) ; et le dépassement éventuel de *L* par la position de début d'alignement sur le sujet (`sstart_nuc_gt_elongation`).
+
+#### 3.5.2 Homologues de catégorie « big » (`ssearch_big_sstart` / `ssearch_big_send`, `bin/{nter,cter}/big_nuc_search.sh`)
+
+Les CDS des sujets sont extraits **sans élongation**, puis alignés en nucléotide/nucléotide contre le CDS de la query avec `ssearch36`. La position de début (ou de fin) de l'alignement protéique est convertie en coordonnée nucléotidique (×3) et comparée à la position obtenue par l'alignement nucléotidique (`parse_big_table`), afin de déterminer si le segment manquant est détectable au niveau ADN au sein du CDS annoté.
+
+### 3.6 Récapitulatif des paramètres et seuils
+
+| Étape | Paramètre | Valeur |
+| --- | --- | --- |
+| DIAMOND vs NR | *e*-value ; `qcovhsp` ; `scovhsp` ; `ppos` | ≤ 10⁻⁵ ; > 60 % ; > 60 % ; > 70 % |
+| DIAMOND vs NR | Restriction taxonomique | Eucaryotes (taxid 2759) |
+| Sélection des candidats | Distance à l'extrémité définissant un alignement « complet » | < 20 résidus (voir note §3.3) |
+| Sélection des candidats | Proportion maximale d'espèces avec alignement complet | ≤ 5 % |
+| ssearch36 (prot/prot) | Matrice ; gap ouverture ; gap extension | BLOSUM50 ; −11 ; −1 |
+| Homologues locaux | *e*-value ; `qcovhsp` ; `ppos` | ≤ 10⁻⁵ ; ≥ 70 % ; > 50 % |
+| Catégorisation | `sstart` ou `slen − send` | < 5 (small) / ≥ 5 (big) |
+| Élongation | *L* | max(3·`qstart`, upstream) × 1,5, multiple de 3 |
+| Élongation | Seuil par sujet *T* | *L* − 2 |
+| Parallélisation | Nombre de groupes `n` | 30 |
+
+### 3.7 Implémentation et reproductibilité
+
+Le pipeline est écrit en Nextflow DSL2 et organisé en un workflow principal (`flows/align.nf`), trois sous-workflows (`subworkflows/A1_preprocess.nf`, `A2_NR.nf`, `A3_search_extensions.nf`) et des modules atomiques (`modules/`). Les scripts shell de `bin/` encapsulent les opérations composites (élongation, alignements multiples) et les programmes C++ de `src/` (`rmStartStop.cpp`, `parseCoati.cpp`) assurent des traitements ponctuels sur les séquences. Les tables intermédiaires sont stockées au format Parquet et converties en TSV avec DuckDB lorsque nécessaire. L'exécution est prise en charge par PBS Pro ; AGAT est distribué sous forme de conteneur Singularity (`container/agat.sif`). Les chemins de tous les exécutables sont centralisés dans `nextflow.config` et exportés vers les scripts shell sous forme de variables d'environnement, avec repli sur le `PATH`.
+
+Ressources HPC typiques :
+
+| Queue | CPUs | RAM | Walltime | Étape |
+| --- | --- | --- | --- | --- |
+| bim | 70 | 400 Go | 40 000 h | DIAMOND vs NR |
+| bim | 16 | 120 Go | 24 h | Parsing des alignements |
+| bim | 10 | 10 Go | 15 h | ssearch36 |
+| common | 4–8 | 8–32 Go | 24 h | Prétraitement |
+| lowprio | 4–6 | 4–8 Go | variable | Parsing léger |
 
 ---
 
-## Outils Utilisés
+## 4. Sorties
 
-Tous les chemins d'outils sont **configurables** via `nextflow.config`. Par défaut, ils utilisent les noms d'outils qui doivent être dans le PATH.
+Les résultats sont écrits dans `output/nter/` et `output/cter/` :
 
-### Outils Bioinformatiques
+| Fichier | Contenu |
+| --- | --- |
+| `full.blast` | Ensemble des alignements protéiques filtrés (§3.4) |
+| `mRNA_species.tsv` | Correspondance transcrit → espèce |
+| `bigFinal` | Résultats consolidés des homologues de catégorie « big » |
+| `smallFinal` | Résultats consolidés des homologues de catégorie « small » |
 
-| Outil | Paramètre Config | Fonction |
-|-------|------------------|----------|
-| **Diamond** | `params.diamond` | Recherche similitude vs NR |
-| **BLAST+** | `params.blastp`, `params.makeblastdb` | Alignements protéiques locaux |
-| **FASTA36 (ssearch36)** | `params.ssearch` | Alignements Smith-Waterman |
-| **tfasty36** | `params.tfasty` | Alignement prot vs ADN traduit |
-| **gffread** | `params.gffread` | Extraction séquences depuis GFF |
-| **bedtools** | `params.bedtools` | Manipulation coordonnées génomiques |
-| **samtools** | `params.samtools` | Indexation génomes |
-| **seqkit** | `params.seqkit` | Manipulation FASTA |
-| **taxonkit** | `params.taxonkit` | Manipulation taxonomie NCBI |
-| **AGAT** | conteneur `agat.sif` | Standardisation GFF |
-| **faTrans** | `params.faTrans` | Traduction ADN → protéine |
-| **faSize** | `params.faSize` | Taille séquences FASTA |
-| **duckdb** | `params.duckdb` | Conversion Parquet → TSV |
+Les fichiers intermédiaires produits par sujet en §3.5.1 sont : `*_complete_small_ssearch_elong.tsv` / `.aln` (alignement élongé, tabulaire et détaillé), `*_complete_small_ssearch_short.tsv` (alignement non élongé), `*_complete_small_tfastx.tsv` (alignement protéique) et `*_subjects_thresholds.tsv` (seuils *T* par sujet).
 
-### Librairies Python
-
-```python
-polars          # Traitement dataframes haute performance
-gff3_parser     # Parsing fichiers GFF3
-Bio (Biopython) # Manipulation séquences
-csv, os, re, glob  # Utilitaires standard
-```
-
----
-
-## Configuration et Exécution
-
-### Configuration (`nextflow.config`)
-
-Le fichier de configuration centralise **tous les paramètres** et **chemins d'outils**. Les chemins peuvent être surchargés en ligne de commande ou via un fichier de configuration personnalisé.
-
-```groovy
-params {
-    // Pipeline parameters
-    n = 30                          // Nombre de groupes pour parallélisation
-    output = "results/"             // Répertoire output
-    
-    // Input directories
-    focal_dir = "input/focal/"      // Répertoire espèce focale
-    neighbors_dir = "input/neighbors/"  // Répertoire espèces voisines
-    
-    // External databases
-    nr = "/path/to/nr.dmnd"         // Base Diamond NR
-    taxdump = "/path/to/taxdump.tar.gz"  // Données taxonomiques NCBI
-    tmpdir = "/tmp"                 // Répertoire temporaire pour Diamond
-    
-    // --- OUTILS (tous configurables) ---
-    // Alignment tools (FASTA36 suite)
-    ssearch = "ssearch36"           // ou chemin absolu
-    tfasty = "tfasty36"
-    
-    // Sequence manipulation
-    seqkit = "seqkit"
-    gffread = "gffread"
-    faTrans = "faTrans"
-    faSize = "faSize"
-    
-    // Database tools
-    diamond = "diamond"
-    blastp = "blastp"
-    makeblastdb = "makeblastdb"
-    
-    // Taxonomy
-    taxonkit = "taxonkit"
-    
-    // Data processing
-    duckdb = "duckdb"
-    
-    // System tools
-    samtools = "samtools"
-    bedtools = "bedtools"
-}
-
-// Les outils sont exportés comme variables d'environnement pour les scripts shell
-process {
-    beforeScript = '''
-        export SSEARCH="${params.ssearch}"
-        export GFFREAD="${params.gffread}"
-        # ... etc
-    '''
-}
-```
-
-### Surcharge des paramètres
-
-```bash
-# Via ligne de commande
-nextflow run main.nf --ssearch /path/to/ssearch36 --diamond /path/to/diamond
-
-# Via fichier de configuration personnalisé
-nextflow run main.nf -c my_local.config
-```
-
-### Exécution
-
-**Soumission PBS** :
-```bash
-qsub run.sh
-# ou
-qsub nxtflw_run.sh
-```
-
-**Exécution directe** :
-```bash
-nextflow run main.nf -resume
-```
-
-### Ressources HPC Typiques
-
-| Queue | CPUs | RAM | Walltime | Utilisé pour |
-|-------|------|-----|----------|--------------|
-| bim | 70 | 400GB | 40000h | Diamond vs NR |
-| bim | 16 | 120GB | 24h | Parsing BLAST |
-| bim | 10 | 10GB | 15h | ssearch |
-| common | 4-8 | 8-32GB | 24h | Prétraitement |
-| lowprio | 4-6 | 4-8GB | variable | Parsing léger |
-
----
-
-## Outputs
-
-### Répertoire output/nter/
-- `bigFinal` : Résultats consolidés des gros sstart
-- `smallFinal` : Résultats consolidés des petits sstart
-- `full.blast` : Tous les alignements filtrés
-- `mRNA_species.tsv` : Mapping mRNA → espèce
-
-### Répertoire output/cter/
-- `bigFinal` : Résultats consolidés des gros send
-- `smallFinal` : Résultats consolidés des petits send
-- `full.blast` : Tous les alignements filtrés
-
-### Colonnes Output (smallFinal nter)
+Colonnes de `smallFinal` (branche N-terminale) :
 
 | Colonne | Description |
-|---------|-------------|
-| qseqid | ID de la protéine query |
-| sseqid | ID de l'homologue subject |
-| gaps_query | Gaps dans la query |
-| gaps_subject | Gaps dans le subject |
-| qstart_nuc_elong | Position début alignement nucléotidique |
-| sstart_nuc_gt_elongation | Si sstart > élongation attendue |
-| stop_inframe | Codon STOP in-frame trouvé |
-| start_inframe | Codon START in-frame trouvé |
-| atg_on_elongated_subject_facing_query_start | ATG face au début query |
-| meth_on_query_facing_subject_start | Méthionine query face au début subject |
-| recovered_elongation | Ratio élongation récupérée |
-| raw_recovered_elongation | Élongation en nucléotides |
-| category | "small" ou "big" |
+| --- | --- |
+| `qseqid` | Identifiant de la protéine query (Dmel) |
+| `sseqid` | Identifiant de l'homologue sujet |
+| `gaps_query` | Nombre de gaps sur la query |
+| `gaps_subject` | Nombre de gaps sur le sujet |
+| `qstart_nuc_elong` | Position de début de l'alignement nucléotidique élongé |
+| `sstart_nuc_gt_elongation` | Début d'alignement sur le sujet supérieur à *L* |
+| `stop_inframe` | Codon STOP en phase dans la région élongée |
+| `start_inframe` | Codon START en phase dans la région élongée |
+| `atg_on_elongated_subject_facing_query_start` | ATG sur le sujet élongé en regard du début de la query |
+| `meth_on_query_facing_subject_start` | Méthionine sur la query en regard du début du sujet annoté |
+| `recovered_elongation` | Fraction de *L* récupérée par l'alignement |
+| `raw_recovered_elongation` | Élongation récupérée, en nucléotides |
+| `category` | « small » ou « big » |
 
 ---
 
-## Reconstruction du Pipeline
+## 5. Utilisation
 
-### Prérequis
+### 5.1 Prérequis
 
-1. **Installation Nextflow** :
 ```bash
 curl -s https://get.nextflow.io | bash
 mv nextflow ~/.local/bin/
 ```
 
-2. **Installation des outils** (voir tableau ci-dessus)
+Les outils listés en §2.4 doivent être installés et accessibles dans le `PATH`, ou leurs chemins renseignés dans la configuration.
 
-3. **Configuration HPC PBS Pro**
+### 5.2 Configuration (`nextflow.config`)
 
-### Étapes de Reconstruction
-
-#### 1. Structure de base
-```bash
-mkdir -p DMEL/{flows,subworkflows/specifics,modules/{preprocess,NR,nter,cter,dev},bin/{nter,cter},src,container,input/{focal,neighbors},output/{nter,cter},test}
-```
-
-#### 2. Fichiers de configuration
-- Créer `nextflow.config` avec les paramètres adaptés
-- Créer `main.nf` qui appelle le workflow `align`
-
-#### 3. Workflow Principal (flows/align.nf)
 ```groovy
-include { preprocess_input_data } from '../subworkflows/A1_preprocess'
-include { create_taxon_maps } from '../modules/create_taxon_maps'
-include { NR } from '../subworkflows/A2_NR'
-include { search_homologs } from '../subworkflows/A3_search_extensions'
+params {
+    n             = 30                    // groupes de parallélisation
+    output        = "results/"
+    focal_dir     = "input/focal/"
+    neighbors_dir = "input/neighbors/"
+    nr            = "/path/to/nr.dmnd"
+    taxdump       = "/path/to/taxdump.tar.gz"
+    tmpdir        = "/tmp"
 
-workflow align {
-    (full_gff, full_fna, index, focal_proteome, local_db, geneCoords, local_proteome) = preprocess_input_data()
-    (strain2species, eukaryotes) = create_taxon_maps()
-    (nter_candidates_IDs, cter_candidates_IDs) = NR(focal_proteome, strain2species, eukaryotes)
-    search_homologs(nter_candidates_IDs, cter_candidates_IDs, local_db, focal_proteome, full_gff, full_fna, index, geneCoords, local_proteome)
+    // Exécutables (nom dans le PATH ou chemin absolu)
+    ssearch = "ssearch36";   tfasty  = "tfasty36"
+    seqkit  = "seqkit";      gffread = "gffread"
+    faTrans = "faTrans";     faSize  = "faSize"
+    diamond = "diamond";     blastp  = "blastp";   makeblastdb = "makeblastdb"
+    taxonkit = "taxonkit";   duckdb  = "duckdb"
+    samtools = "samtools";   bedtools = "bedtools"
+}
+
+process {
+    beforeScript = '''
+        export SSEARCH="${params.ssearch}"
+        export GFFREAD="${params.gffread}"
+        # ...
+    '''
 }
 ```
 
-#### 4. Subworkflows à implémenter
-1. **A1_preprocess** : Enchaînement extraction → concat → makedb → faidx → getGeneCoords
-2. **A2_NR** : Diamond → split → parseDiamond → collectFile
-3. **A3_search_extensions** : grep → ssearch → parse → (big/small workflows)
+Surcharge en ligne de commande ou par fichier de configuration :
 
-#### 5. Modules clés à recréer
+```bash
+nextflow run main.nf --ssearch /path/to/ssearch36 --diamond /path/to/diamond
+nextflow run main.nf -c my_local.config
+```
 
-**Priorité 1** (flux principal) :
-- `modules/preprocess/*.nf`
-- `modules/NR/*.nf`
-- `modules/blastp.nf`
-- `modules/grepSeq.nf`
-- `modules/parseNeighborsBlastp.nf`
+### 5.3 Exécution
 
-**Priorité 2** (analyse détaillée) :
-- `modules/nter/treatSmallSstart.nf` (le plus complexe)
-- `modules/nter/treatBigSstart.nf`
-- `modules/cter/treatSmallSend.nf`
-- `modules/cter/treatBigSend.nf`
+```bash
+# Soumission PBS
+qsub run.sh          # ou : qsub nxtflw_run.sh
 
-#### 6. Scripts shell critiques
-- `bin/ssearch.sh` : Wrapper ssearch avec output formaté
-- `bin/nter/small_nuc_search.sh` : Logique d'élongation et alignements multiples
-- `bin/nter/big_nuc_search.sh` : Alignement sans élongation
-- `bin/cter/*.sh` : Équivalents pour C-terminal
-
-### Points d'attention
-
-1. **Portabilité** : Tous les chemins d'outils sont désormais configurables dans `nextflow.config`. Les scripts shell utilisent des variables d'environnement avec fallback vers le PATH :
-   ```bash
-   SSEARCH=${SSEARCH:-ssearch36}  # Utilise $SSEARCH si défini, sinon 'ssearch36'
-   ```
-
-2. **Format Parquet** : Les données intermédiaires utilisent Parquet, nécessitant duckdb pour la conversion
-
-3. **Parsing ssearch** : Le format `-m A` de ssearch36 produit un alignement position par position qui nécessite un parsing spécifique
-
-4. **Gestion des strands** : L'élongation doit être faite du bon côté selon le strand (+/-)
-
-5. **Seuils et filtres** :
-   - Homologie : evalue <= 1e-5, qcovhsp >= 70%, ppos > 50%
-   - Candidats NR : < 5% avec alignement complet aux extrémités
-   - Catégorisation : sstart/send < 5 vs >= 5
+# Exécution directe
+nextflow run main.nf -resume
+```
 
 ---
 
-## Licence et Contact
+## 6. Organisation du dépôt
 
-*Pipeline développé par Simon Herman - BIM Team*
+```
+DMEL/
+├── main.nf                     # Point d'entrée (workflow align)
+├── nextflow.config             # Paramètres, exécuteur, chemins d'outils
+├── run.sh / nxtflw_run.sh      # Soumission PBS
+├── flows/align.nf              # Workflow principal
+├── subworkflows/
+│   ├── A1_preprocess.nf        # §3.2
+│   ├── A2_NR.nf                # §3.3
+│   ├── A3_search_extensions.nf # §3.4
+│   └── specifics/              # nter/cter × big/small (§3.5)
+├── modules/
+│   ├── preprocess/             # extract_protein, makedb, faidx, concat, getGeneCoords, ...
+│   ├── NR/                     # diamond, parseDiamond, split_ids, split_df
+│   ├── nter/  cter/            # treatBig*, treatSmall*
+│   ├── ssearch.nf  blastp.nf  grepSeq.nf
+│   ├── parseNeighborsBlastp.nf create_taxon_maps.nf  standardGff.nf
+├── bin/
+│   ├── ssearch.sh              # Wrapper ssearch36
+│   ├── gff.sh  split_dataframe.sh
+│   ├── nter/{big,small}_nuc_search.sh
+│   └── cter/{big,small}_nuc_search.sh
+├── src/                        # rmStartStop.cpp, parseCoati.cpp, json.hpp, compil.sh
+├── container/agat.sif
+├── input/
+│   ├── focal/                  # Dmel.{fna,gff,proteome}
+│   ├── neighbors/              # [Species].{fna,gff}
+│   └── neighbors.genome
+├── output/{nter,cter}/
+├── test/
+├── Drosophila_tree.nwk
+└── Dmel.tsv                    # Table DIAMOND vs NR (~1,1 Go)
+```
 
 ---
 
-## Changelog
+## 7. Références
 
-- **v1.0** : Pipeline initial pour *D. melanogaster*
-- Support pour analyse N-terminale et C-terminale
-- Intégration Diamond, BLAST, ssearch36
-- Parallélisation PBS Pro
+- Buchfink B, Reuter K, Drost HG. Sensitive protein alignments at tree-of-life scale using DIAMOND. *Nat Methods*. 2021;18:366–368.
+- Camacho C, Coulouris G, Avagyan V, et al. BLAST+: architecture and applications. *BMC Bioinformatics*. 2009;10:421.
+- Cock PJA, Antao T, Chang JT, et al. Biopython: freely available Python tools for computational molecular biology and bioinformatics. *Bioinformatics*. 2009;25:1422–1423.
+- Dainat J. AGAT: Another Gff Analysis Toolkit to handle annotations in any GTF/GFF format. Zenodo. doi:10.5281/zenodo.3552717.
+- Danecek P, Bonfield JK, Liddle J, et al. Twelve years of SAMtools and BCFtools. *GigaScience*. 2021;10:giab008.
+- Di Tommaso P, Chatzou M, Floden EW, et al. Nextflow enables reproducible computational workflows. *Nat Biotechnol*. 2017;35:316–319.
+- Kent WJ, Sugnet CW, Furey TS, et al. The human genome browser at UCSC. *Genome Res*. 2002;12:996–1006.
+- Kurtzer GM, Sochat V, Bauer MW. Singularity: scientific containers for mobility of compute. *PLoS ONE*. 2017;12:e0177459.
+- Pearson WR, Lipman DJ. Improved tools for biological sequence comparison. *Proc Natl Acad Sci USA*. 1988;85:2444–2448.
+- Pearson WR. Searching protein sequence libraries: comparison of the sensitivity and selectivity of the Smith-Waterman and FASTA algorithms. *Genomics*. 1991;11:635–650.
+- Pertea G, Pertea M. GFF Utilities: GffRead and GffCompare. *F1000Research*. 2020;9:304.
+- Quinlan AR, Hall IM. BEDTools: a flexible suite of utilities for comparing genomic features. *Bioinformatics*. 2010;26:841–842.
+- Raasveldt M, Mühleisen H. DuckDB: an embeddable analytical database. *Proc. SIGMOD*. 2019.
+- Shen W, Le S, Li Y, Hu F. SeqKit: a cross-platform and ultrafast toolkit for FASTA/Q file manipulation. *PLoS ONE*. 2016;11:e0163962.
+- Shen W, Ren H. TaxonKit: a practical and efficient NCBI taxonomy toolkit. *J Genet Genomics*. 2021;48:844–850.
 
+---
+
+## Historique
+
+- **v1.0** — Pipeline initial pour *D. melanogaster* : branches N- et C-terminales, intégration DIAMOND / BLAST+ / FASTA36, parallélisation PBS Pro.
