@@ -44,30 +44,36 @@ Soixante-trois espèces du genre *Drosophila* (`input/neighbors/`), chacune repr
 
 ### 2.3 Bases de données externes
 
-- **NCBI NR** au format DIAMOND (`nr_2.0.13.dmnd`), interrogée avec une restriction aux eucaryotes (taxid 2759).
+- **NCBI NR** au format DIAMOND (`/datas/NR/NR/nr_2.0.13.dmnd` ; format de base 3, build 151 ; 707 028 945 séquences, 2,73 × 10¹¹ résidus), interrogée avec une restriction aux eucaryotes (taxid 2759).
 - **NCBI Taxonomy** (`taxdump`), utilisée pour la conversion souche → espèce et pour la définition de l'ensemble des taxids eucaryotes.
 
 ### 2.4 Outils logiciels
 
-Tous les chemins d'exécutables sont paramétrables dans `nextflow.config` (voir §5.2). Les versions exactes utilisées sont à renseigner dans la colonne correspondante.
+Tous les chemins d'exécutables sont paramétrables dans `nextflow.config` (voir §5.2).
 
 | Outil | Version | Usage dans le pipeline | Référence |
 | --- | --- | --- | --- |
-| Nextflow (DSL2) | — | Orchestration du workflow | Di Tommaso et al., 2017 |
-| Singularity | — | Conteneurisation (AGAT) | Kurtzer et al., 2017 |
-| PBS Pro | — | Ordonnancement HPC | — |
-| DIAMOND | — | Recherche de similarité contre NR | Buchfink et al., 2021 |
-| BLAST+ (`makeblastdb`, `blastp`) | — | Base de données protéique locale, alignements protéiques | Camacho et al., 2009 |
-| FASTA36 (`ssearch36`, `tfasty36`) | — | Alignements Smith-Waterman prot/prot, nuc/nuc et prot/ADN traduit | Pearson & Lipman, 1988 ; Pearson, 1991 |
-| gffread | — | Extraction des CDS et des protéines depuis GFF + génome | Pertea & Pertea, 2020 |
-| BEDTools (`slop`) | — | Extension de coordonnées génomiques | Quinlan & Hall, 2010 |
-| SAMtools (`faidx`) | — | Indexation des génomes | Danecek et al., 2021 |
-| SeqKit | — | Manipulation de fichiers FASTA | Shen et al., 2016 |
-| TaxonKit | — | Manipulation de la taxonomie NCBI | Shen & Ren, 2021 |
-| AGAT | — | Standardisation des GFF | Dainat |
-| UCSC utilities (`faTrans`, `faSize`) | — | Traduction ADN → protéine, tailles de séquences | Kent et al., 2002 |
-| DuckDB | — | Conversion Parquet → TSV | Raasveldt & Mühleisen, 2019 |
-| Python (Polars, Biopython, gff3_parser) | — | Parsing et traitement des tables | Cock et al., 2009 |
+| Nextflow (DSL2) | 25.10.4 (Java 21.0.11) | Orchestration du workflow | Di Tommaso et al., 2017 |
+| Singularity | 1.4.5 | Conteneurisation (AGAT) | Kurtzer et al., 2017 |
+| PBS Pro | *à préciser* | Ordonnancement HPC | — |
+| DIAMOND | 2.1.8 | Recherche de similarité contre NR | Buchfink et al., 2021 |
+| BLAST+ (`makeblastdb`, `blastp`) | 2.16.0 | Base de données protéique locale, alignements protéiques | Camacho et al., 2009 |
+| FASTA36 (`ssearch36`, `tfasty36`) | 36.3.8i | Alignements Smith-Waterman prot/prot, nuc/nuc et prot/ADN traduit | Pearson & Lipman, 1988 ; Pearson, 1991 |
+| gffread | 0.12.7 | Extraction des CDS et des protéines depuis GFF + génome | Pertea & Pertea, 2020 |
+| BEDTools (`slop`) | 2.31.1 | Extension de coordonnées génomiques | Quinlan & Hall, 2010 |
+| SAMtools (`faidx`) | 1.21 | Indexation des génomes | Danecek et al., 2021 |
+| SeqKit | 2.6.1 | Manipulation de fichiers FASTA | Shen et al., 2016 |
+| TaxonKit | 0.20.0 | Manipulation de la taxonomie NCBI | Shen & Ren, 2021 |
+| AGAT | *à préciser* (conteneur `agat.sif`) | Standardisation des GFF | Dainat |
+| UCSC utilities (`faTrans`, `faSize`) | binaires du 2024-02-09 (pas de numéro de version) | Traduction ADN → protéine, tailles de séquences | Kent et al., 2002 |
+| DuckDB | 1.2.0 | Conversion Parquet → TSV | Raasveldt & Mühleisen, 2019 |
+| Python | 3.13.5 | Parsing et traitement des tables | — |
+| Polars | 1.37.1 | Traitement des dataframes | — |
+| Biopython | 1.85 | Manipulation de séquences | Cock et al., 2009 |
+| gff3_parser | 0.0.5 | Parsing GFF3 | — |
+| g++ | 14.2.0 | Compilation de `src/` | — |
+
+Versions relevées le 28/09/2026 avec `get_versions.sh` (sortie complète dans `versions.md`).
 
 ---
 
@@ -277,7 +283,7 @@ params {
     output        = "results/"
     focal_dir     = "input/focal/"
     neighbors_dir = "input/neighbors/"
-    nr            = "/path/to/nr.dmnd"
+    nr            = "/datas/NR/NR/nr_2.0.13.dmnd"
     taxdump       = "/path/to/taxdump.tar.gz"
     tmpdir        = "/tmp"
 
@@ -374,8 +380,3 @@ DMEL/
 - Shen W, Le S, Li Y, Hu F. SeqKit: a cross-platform and ultrafast toolkit for FASTA/Q file manipulation. *PLoS ONE*. 2016;11:e0163962.
 - Shen W, Ren H. TaxonKit: a practical and efficient NCBI taxonomy toolkit. *J Genet Genomics*. 2021;48:844–850.
 
----
-
-## Historique
-
-- **v1.0** — Pipeline initial pour *D. melanogaster* : branches N- et C-terminales, intégration DIAMOND / BLAST+ / FASTA36, parallélisation PBS Pro.
